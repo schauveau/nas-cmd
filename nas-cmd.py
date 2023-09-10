@@ -29,6 +29,13 @@ PASSWORD='xxxxxxxx'
 
 p = None
 
+#
+# Escape some characters in string str 
+# 
+def escape_string(str):
+    #return str.replace("\n",r'\n').replace("\t",r'\t').replace("\\",r'\\')
+    return repr(str[1:-1])
+
 # Provide the full class name of an object 
 def full_class_name(o):
     c = o.__class__
@@ -205,6 +212,7 @@ class NasPortal:
                                        )
 
         self.login_info = json ;
+        self.login_content = resp.content ;
 
         self.sid = self.login_info["sid"]
         self.url = url
@@ -251,467 +259,500 @@ class NasPortal:
                 print(message)
         else:
             print("Unexpected reponse type : ",type(r))
-            
 
-def action_upload(nas, argv):
-    
-    parser = argparse.ArgumentParser("nas-cmd upload",
-                                     description='Upload a file',
-                                     epilog=\
-                                     "\n"\
-                                     "\n",
-                                     formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('src',  
-                        help="Source file")
- 
-    parser.add_argument('dest', 
-                        help="Destination directory in an accessible share")
+# Base class to implement ADM actions
+#
+class Action:
 
-    parser.add_argument('filename',  nargs='?', default=None,                        
-                        help="The filename to create. Default is to reuse\n"\
-                        "the name of the source file"
-                        )
+    all_instances={}  # Will hold all instances of Action 
 
-    a = parser.parse_args(argv[1:]) 
+    def __init__(self, name, subparser, **kwargs):
+        self.name = name
+        self.parser = subparser.add_parser(name, **kwargs) ;
+        assert not name in Action.all_instances
+        Action.all_instances[self.name] = self 
 
-    src=Path(a.src)
-    if not src.is_file() :
-        err_print("specified src does not exist or is not a file")
-        sys.exit(1)
+    @staticmethod
+    def find(name) :
+        return Action.all_instances[name]
         
-    with src.open("rb") as f :
-        payload=f.read()
-
-    if not a.filename is None: 
-        filename = a.filename
-    else:
-        filename = src.name
-    
-    files = {'file': (filename,  payload , "text/plain") }
-
-    r, json = nas.request_json( 'POST',
-                                "/portal/apis/fileExplorer/upload.cgi",
-                                params = {
-                                    'act': 'upload',
-                                    'overwrite': 1,  # 0=skip 1=overwrite
-                                    'path': a.dest,
-                                    'filesize': len(payload),
-                                },
-                                files = { 'file': (filename,  payload , "text/plain")  } )
-    
-    
-def action_download(nas, argv):
-
-    parser = argparse.ArgumentParser("nas-cmd download",
-                                     description='Download a file',
-                                     epilog=\
-                                     "\n"\
-                                     "\n",
-                                     formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('-q', '--quiet', action='store_true',
-                        help='Be quiet in case of success')
-    
-    parser.add_argument('src',  default='share', 
-                        help="")
- 
-    parser.add_argument('dest', nargs='?', default=None,
-                        help="")
-       
-    a = parser.parse_args(argv[1:]) 
-
-    # Detect an explicit directory syntax before PurePosixPath
-    # simplifies it.    
-    if a.src.endswith('/') or a.src.endswith('/.'):
-        err_print("src must be a file ; not a directoryy")
-        sys.exit(2)
-    src=PurePosixPath(a.src)
-    if not src.is_absolute() :
-        err_print("src must be an absolute path")
-        sys.exit(2)
-
-    r, json = nas.request_json( 'POST',
-                               "/portal/apis/fileExplorer/download.cgi",
-                               json_raise_on_error=True,
-                               json_or_attachment=True,
-                               params = {
-                                   'act': 'download',
-                                   'path': src.parent,
-                                   'total': 1,
-                                   'mod_cntype': 0,                              
-                                   'file': src.name,          
-                               } )
-    
-    # The only JSON responses expected after a download request are error messages
-    # and they should raise an exception. Just to be sure ...
-    assert json is None
-
-
-    if a.dest:
-        if Path(a.dest).is_dir():
-            dest=str(Path(a.dest) / src.name)
-        else:
-            dest=a.dest
-    else:
-        dest=src.name
-
-    if not a.quiet:
-        err_print(f"download {len(r.content)} bytes in {dest} \n")
-
-    with open(dest,"wb") as output:
-        output.write(r.content)
-
-    return 0
-
-def action_cat(nas, argv):
-
-    cmd=argv[0]
-    parser = argparse.ArgumentParser("nas-cmd cat",
-                                     description='Download and print a file to stdout',
-                                     epilog=\
-                                     "\n"\
-                                     "\n",
-                                     formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('-i', '--info', action='store_true',
-                        help='print summary information instead')
-    parser.add_argument('src',  default='share', 
-                        help="")
-       
-    a = parser.parse_args(argv[1:]) 
-
-    # Detect an explicit directory syntax before it is simplified by PurePosixPath 
-    if a.src.endswith('/') or a.src.endswith('/.'):
-        err_print("src must be a file ; not a directoryy")
-        sys.exit(2)
-    src=PurePosixPath(a.src)
-    if not src.is_absolute() :
-        err_print("src must be an absolute path")
-        sys.exit(2)
-
-    r, json = nas.request_json( 'POST',
-                                "/portal/apis/fileExplorer/download.cgi",
-                                json_raise_on_error=True,
-                                json_or_attachment=True,
-                                params = {
-                                    'act': 'download',
-                                    'path': src.parent,
-                                    'total': 1,
-                                    'mod_cntype': 0,                              
-                                    'file': src.name
-                                }
-                               )
-    
-    # The only JSON responses expected after a download request are error messages
-    # and they should raise an exception. Just to be sure ...
-    assert json is None
-
-    if a.info:
-        md5sum=hashlib.md5(r.content).hexdigest()
-        print(f"filename={repr(src.name)}")
-        print(f"directory={repr(str(src.parent))}")
-        print(f"size={len(r.content)}")
-        print(f"md5={md5sum}")
-    else:
-        sys.stdout.buffer.write(r.content)
-
-    return 0
-
-
-def action_query(nas, argv):
-
-    cmd=argv[0]
-    parser = argparse.ArgumentParser("nas-cmd query",
-                                     description='Perform a custom cgi query',
-                                     epilog=\
-                                     "\n"\
-                                     "Parameter specifications of the form name=value are sent in the query string \n"\
-                                     "while those of the form name:=value are sent in the body. \n"\
-                                     "\n"\
-                                     "The 'sid' argument is implictly passed and should not be specified here\n"\
-                                     ,
-                                     formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('-i', '--info', action='store_true',
-                        help='print summary information instead')
-    parser.add_argument('-r', '--raw', action='store_true',
-                        help="print the raw response")
-    parser.add_argument('cgi',
-                        help="path to the cgi file")
-    parser.add_argument('spec', nargs='*',
-                        help="parameter specification of the form name=value or name:=value")
-       
-    a = parser.parse_args(argv[1:]) 
-
-    if not ( a.cgi.startswith('/portal/apis/') and a.cgi.endswith('.cgi') ) :
-        err_print("cgi should be of the form '/portal/apis/.../FILE.cgi'")
-        sys.exit(2)
-
-    # Transform each param_spec into an entry in params or in data 
-    params={}
-    data={}
-    re_spec=re.compile("^([a-zA-Z_][a-zA-Z_0-9]*)(=|:=)(.*)$")
-    for spec in a.spec:
-        m = re_spec.match(spec)
-        if not m:
-            err_print(f"unexpected argument {spec}. Expect name=value or name:=value")
+class UploadAction(Action):
+    def __init__(self, name, subparser):
+        super().__init__( name,
+                          subparser,
+                          help='Upload a file to the NAS',
+                          description='Upload a file',
+                          epilog=\
+                          "\n"\
+                          "\n",
+                          formatter_class=argparse.RawTextHelpFormatter )
+        
+        self.parser.add_argument('src',
+                                 help="Source file")
+        
+        self.parser.add_argument('dest', 
+                                 help="Destination directory in an accessible share")
+        
+        self.parser.add_argument('filename',  nargs='?', default=None,                        
+                                 help="The filename to create. Default is to reuse\n"\
+                                 "the name of the source file"
+                                 )
+        
+    def run(self, nas, args):
+        src=Path(args.src)
+        if not src.is_file() :
+            err_print("specified src does not exist or is not a file")
             sys.exit(1)
-        if m.group(1) == 'sid':
-            err_print(f"Warning: Ignoring sid parameter")
-            continue
-        if m.group(2) == '=' :
-            params[m.group(1)] = m.group(3) 
-        elif m.group(2) == ':=' :
-            data[m.group(1)] = m.group(3) 
+
+        with src.open("rb") as f :
+            payload=f.read()
+
+        if not args.filename is None: 
+            filename = args.filename
         else:
-            assert False
+            filename = src.name
 
-    r, json = nas.request_json( 'POST',
-                                a.cgi,
-                                json_raise_on_error=False,  
-                                json_or_attachment=True,    
-                                params = params,
-                                data = data
-                               )
-    if a.raw:        
-        sys.stdout.buffer.write(r.content)
-    else:
-        pprint.pprint(json)
+        files = {'file': (filename,  payload , "text/plain") }
+
+        r, json = nas.request_json( 'POST',
+                                    "/portal/apis/fileExplorer/upload.cgi",
+                                    params = {
+                                        'act': 'upload',
+                                        'overwrite': 1,  # 0=skip 1=overwrite
+                                        'path': args.dest,
+                                        'filesize': len(payload),
+                                    },
+                                    files = { 'file': (filename,  payload , "text/plain")  } )
+
         
-    return 0
-
-
-def action_list_directory(nas, argv):
-    filter=''
-    output='name'
-    escape=False
-
-    cmd=argv[0]
-
-    if cmd=='ll' or cmd=='vdir' :
-        default_mode='long'
-    else:
-        default_mode='short'
-
-    parser = argparse.ArgumentParser("nas-cmd [ls|dir|ll|vdir]",
-                                     description='List share content',
-                                     epilog=
-                                     "The location can be one of\n"
-                                     "  - an absolute path within a share (e.g. /Public/my_dir)\n"
-                                     "  - a path in a user home directory (e.g. /home/foobar/Photos)\n"
-                                     "  - one of the following special locations:\n"
-                                     "    share, share_folders, virtual_share, external_share,\n"
-                                     "    cifs, ezsync, recycle_bin\n",
-                                     formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('-e', '--escape', action='store_true',
-                        help='escape special characters in filenames')
-    parser.add_argument('-f', '--filter', type=str, metavar='TEXT',required=False, default=None,
-                        help='show only the filenames containing TEXT')
-
-    # Those options control the output mode
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument('-s', '--short', action='store_const', dest='mode', const='short', default=default_mode,
-                            help='display only the filenames')
-    mode_group.add_argument('-l', '--long', action='store_const', dest='mode', const='long', default=default_mode,
-                            help='use a long listing format')
-    mode_group.add_argument('-j', '--json', action='store_const', dest='mode', const='json',
-                            help='display the whole json response')
-                            
-
-    parser.add_argument('location', nargs='?', default='share', 
-                        help="The location to list (default is '%(default)s'}")
-    
-    a = parser.parse_args(argv[1:]) 
-    
-    if True:
-        page=None
-        start=None
-        limit=None
-    else:
-        page=0 
-        start=0
-        limit=500
-                        
-    
-    r, ans = nas.request_json( 'GET',
-                               "/portal/apis/fileExplorer/fileExplorer.cgi",
-                               params = {
-                                   'act': 'file_list',
-                                   'path': a.location,
-                                   'filter': a.filter,
-                                   'page':  page,
-                                   'start': start,
-                                   'limit': limit,
-                                   'showhome':True  # Home is not listed by default in 'shares'
-                               } )
-    
-
-    if  a.mode == 'long' :
+class DownloadAction(Action):
+    def __init__(self, name, subparser):
+        super().__init__( name,
+                          subparser,
+                          help='Download a file',
+                          description='Download a file',
+                          epilog=\
+                          "\n"\
+                          "\n",
+                          formatter_class=argparse.RawTextHelpFormatter
+                         )
+        self.parser.add_argument('-q', '--quiet', action='store_true',
+                                 help='Be quiet in case of success')
         
-        octal_to_rwx={'0':'---', '1':'--x', '2':'-w-', '3':'-wx',
-                      '4':'r--', '5':'r-x', '6':'rw-', '7':'rwx'}
-        print("total {}".format(ans['total']) )
-        for entry in ans['data'] :
+        self.parser.add_argument('src',  default='share', 
+                                 help="")
         
-            filename    = entry['filename']
-            is_dir      = entry.get('is_dir',False)
-            modify_time = entry.get('modify_time_',0)
-            file_size   = entry.get('file_size','?')
-            owner       = entry.get('owner','?')
-            group       = entry.get('group','?')
-            file_permission = entry.get('file_permission','')
-        
-            filename = filename.replace("\n",r'\n').replace("\t",r'\t').replace("\\",r'\\')
+        self.parser.add_argument('dest', nargs='?', default=None,
+                                 help="")
+       
+    def run(self, nas, args):
+        # Detect an explicit directory syntax before PurePosixPath simplifies it.
+        if args.src.endswith('/') or args.src.endswith('/.'):
+            err_print("src must be a file ; not a directoryy")
+            sys.exit(2)
+        src=PurePosixPath(args.src)
+        if not src.is_absolute() :
+            err_print("src must be an absolute path")
+            sys.exit(2)
+
+        r, json = nas.request_json( 'POST',
+                                   "/portal/apis/fileExplorer/download.cgi",
+                                   json_raise_on_error=True,
+                                   json_or_attachment=True,
+                                   params = {
+                                       'act': 'download',
+                                       'path': src.parent,
+                                       'total': 1,
+                                       'mod_cntype': 0,                              
+                                       'file': src.name,          
+                                   } )
+
+        # The only JSON responses expected after a download request are error messages
+        # and they should raise an exception. Just to be sure ...
+        assert json is None
+
+
+        if args.dest:
+            if Path(args.dest).is_dir():
+                dest=str(Path(args.dest) / src.name)
+            else:
+                dest=args.dest
+        else:
+            dest=src.name
+
+        if not args.quiet:
+            err_print(f"download {len(r.content)} bytes in {dest} \n")
+
+        with open(dest,"wb") as output:
+            output.write(r.content)
+
+        return 0
+
+class CatAction(Action):
+    def __init__(self, name, subparser):
+        super().__init__( name,
+                          subparser,
+                          help='Download and display a file',
+                          description='Download and print a file to stdout',
+                          epilog=\
+                          "\n"\
+                          "\n",
+                          formatter_class=argparse.RawTextHelpFormatter
+                         )
+        self.parser.add_argument('-i', '--info', action='store_true',
+                                 help='print summary information instead')
+        self.parser.add_argument('src',  default='share', 
+                                 help="")        
+    def run(self, nas, args):
+
+        # Detect an explicit directory syntax before it is simplified by PurePosixPath 
+        if args.src.endswith('/') or args.src.endswith('/.'):
+            err_print("src must be a file ; not a directoryy")
+            sys.exit(2)
             
-            # Truncate owner and group to 10 character using + to indicate truncation.
-            if len(owner)>10 :
-                owner=owner[0:9]+'+'
-            if len(group)>10 :
-                group=group[0:9]+'+'
-                    
-            if len(file_permission) ==  3:
-                mode = \
-                    octal_to_rwx.get(file_permission[0],'???')+\
-                    octal_to_rwx.get(file_permission[1],'???')+\
-                    octal_to_rwx.get(file_permission[2],'???')
+        src=PurePosixPath(args.src)
+
+        if not src.is_absolute() :
+            err_print("src must be an absolute path")
+            sys.exit(2)
+
+        r, json = nas.request_json( 'POST',
+                                    "/portal/apis/fileExplorer/download.cgi",
+                                    json_raise_on_error=True,
+                                    json_or_attachment=True,
+                                    params = {
+                                        'act': 'download',
+                                        'path': src.parent,
+                                        'total': 1,
+                                        'mod_cntype': 0,                              
+                                        'file': src.name
+                                    }
+                                   )
+
+        # The only JSON responses expected after a download request are error messages
+        # and they should raise an exception. Just to be sure ...
+        assert json is None
+
+        if args.info:
+            md5sum=hashlib.md5(r.content).hexdigest()
+            print(f"filename={repr(src.name)}")
+            print(f"directory={repr(str(src.parent))}")
+            print(f"size={len(r.content)}")
+            print(f"md5={md5sum}")
+        else:
+            sys.stdout.buffer.write(r.content)
+
+        return 0
+
+    
+
+class QueryAction(Action):
+    def __init__(self, name, subparser):
+        super().__init__( name,
+                          subparser,
+                          help='Perform a custom cgi query',
+                          description='Perform a custom cgi query',
+                          epilog=\
+                          "\n"\
+                          "Parameter specifications of the form name=value are sent in the query string \n"\
+                          "while those of the form name:=value are sent in the body. \n"\
+                          "\n"\
+                          "The 'sid' argument is implictly passed and should not be specified here\n"\
+                          ,
+                          formatter_class=argparse.RawTextHelpFormatter
+                         )
+        self.parser.add_argument('-i', '--info', action='store_true',
+                                help='print summary information instead')
+        self.parser.add_argument('-r', '--raw', action='store_true',
+                                 help="print the raw response")
+        self.parser.add_argument('cgi',
+                                 help="path to the cgi file")
+        self.parser.add_argument('spec', nargs='*',
+                                 help="parameter specification of the form name=value or name:=value")
+       
+    def run(self, nas, args):
+
+        if not ( a.cgi.startswith('/portal/apis/') and a.cgi.endswith('.cgi') ) :
+            err_print("cgi should be of the form '/portal/apis/.../FILE.cgi'")
+            sys.exit(2)
+
+        # Transform each param_spec into an entry in params or in data 
+        params={}
+        data={}
+        re_spec=re.compile("^([a-zA-Z_][a-zA-Z_0-9]*)(=|:=)(.*)$")
+        for spec in a.spec:
+            m = re_spec.match(spec)
+            if not m:
+                err_print(f"unexpected argument {spec}. Expect name=value or name:=value")
+                sys.exit(1)
+            if m.group(1) == 'sid':
+                err_print(f"Warning: Ignoring sid parameter")
+                continue
+            if m.group(2) == '=' :
+                params[m.group(1)] = m.group(3) 
+            elif m.group(2) == ':=' :
+                data[m.group(1)] = m.group(3) 
             else:
-                mode='?????????'
-                        
-            if is_dir:
-                mode='d' + mode
-                filename=filename+'/'
-            else:
-                mode='-' + mode
+                assert False
 
-            print('{:10} {:10} {:10} {:12} {} {}'.format(mode, owner, group, file_size, modify_time, filename) )
+        r, json = nas.request_json( 'POST',
+                                    a.cgi,
+                                    json_raise_on_error=False,  
+                                    json_or_attachment=True,    
+                                    params = params,
+                                    data = data
+                                   )
+        if a.raw:        
+            sys.stdout.buffer.write(r.content)
+        else:
+            pprint.pprint(json)
+
+        return 0
+
+
+class LoginInfoAction(Action):
+    
+    def __init__(self, name, subparser):
+        super().__init__( name, subparser,
+                          help='Print login response',
+                          description='Print login response'
+                          )
+        self.parser.add_argument('-r', '--raw', action='store_true',
+                                 help="print the raw response")
         
-    elif a.mode == 'short' :
-        for entry in ans['data'] :
-            filename    = entry['filename']
-            print(filename)
-    elif a.mode == 'json' :
-        pprint.pprint('json')
-    else:
-        raise "Unhandled mode"
-
-    #if ans['data']:
-    #    pprint.pprint(ans['data'][0])
+    def run(self, nas, args):
+        if args.raw :
+            sys.stdout.buffer.write(nas.login_content)
+        else:
+            pprint.pprint(nas.login_info)
         
+class ListDirectoryAction(Action):
+    
+    def __init__(self, name, subparser, default_mode):
+        self.name = name
 
-  
-def usage_main():
-    err_print("Usage: nas-cmd.py [OPTIONS] ACTION [ARGUMENTS]")
-    err_print("Execute an ACTION using the ADM Portal web interface")
-    err_print()
-    err_print("The main OPTIONS must be specified before the ACTION and its ARGUMENTS")
-    err_print("  -h, --help              Show this help")
-    err_print("  -d, --debug             Enable debug output in HTTPConnection")
-    err_print("  -v, --verbose           Enable debug in logging")
-    err_print("  -A, --account=NAME      Set the ADM user account")
-    err_print("  -P, --password=TEXT     Set the ADM password")
-    err_print("  -U, --url=URL           Set the ADM url (e.g. https://hostname:port/)")
-    err_print("  -C, --credentials=FILE  Read password, account, and url from a file")
-    err_print("")
-    err_print("The following ACTIONs are currently supported")
-    err_print("")
-    err_print("  login             to print the JSON response to login")
-    err_print("  ls,dir,ll,vdir    to list the content of an ADM directory")
-    err_print("  download          to download a file from ADM")
-    err_print("  upload            to upload a file from ADM")
-    err_print("  cat               print the content of an ADM file")
-    err_print("")
-    err_print("Most actions implement a -h or --help option in their arguments")
-    err_print("")
-    err_print("The credential FILE is a simple text file. The first line provides")
-    err_print("the account, the second the password and the third the URL")
-    err_print("")
+        epilog=\
+            "\n"\
+            "Parameter specifications of the form name=value are sent in the query string \n"\
+            "while those of the form name:=value are sent in the body. \n"\
+            "\n"\
+            "The 'sid' argument is implictly passed and should not be specified here\n"
+            
+        super().__init__( name,
+                          subparser, 
+                          help="List directory",
+                          description='List directory',
+                          epilog=epilog,
+                          formatter_class=argparse.RawTextHelpFormatter
+                         )
+        self.parser.add_argument('-e', '--escape', action='store_true',
+                                 help='escape special characters in filenames')
+        self.parser.add_argument('-f', '--filter', type=str, metavar='TEXT',required=False, default=None,
+                                 help='show only the filenames containing TEXT')
+        self.parser.add_argument('-0', '--null', action='store_true',
+                                 help='use null character as separator instead of newline (short mode only)')
+        
+        # Those options control the output mode
+        mode_group = self.parser.add_mutually_exclusive_group()
+        mode_group.add_argument('-s', '--short', action='store_const', dest='mode', const='short', default=default_mode,
+                                help='display the filenames only')
+        mode_group.add_argument('-l', '--long', action='store_const', dest='mode', const='long',
+                                help='display using a long listing format')
+        mode_group.add_argument('-a', '--all', action='store_const', dest='mode', const='full',
+                                help='display the full response')
+        mode_group.add_argument('-r', '--raw', action='store_const', dest='mode', const='raw',
+                                help='display the raw json response ')
+        
+        self.parser.add_argument('location', nargs='?', default='share', 
+                            help="The location to list (default is '%(default)s'}")
+
+    def run(self, nas, args):
+        
+        # TODO: For now, 'paging' is not implemented. Be aware that
+        # the HTTP request may take several minutes to complete when
+        # the directory contains a few thousands entries. 
+        page=None  
+        start=None 
+        limit=None 
+
+        r, ans = nas.request_json( 'GET',
+                                   "/portal/apis/fileExplorer/fileExplorer.cgi",
+                                   params = {
+                                       'act': 'file_list',
+                                       'path': args.location,
+                                       'filter': args.filter,
+                                       'page':  page,
+                                       'start': start,
+                                       'limit': limit,
+                                       'showhome':True  # Home is not listed by default in 'shares'
+                                   } )
+
+
+        if  args.mode == 'long' :
+        
+            octal_to_rwx={'0':'---', '1':'--x', '2':'-w-', '3':'-wx',
+                          '4':'r--', '5':'r-x', '6':'rw-', '7':'rwx'}
+            print("total {}".format(ans['total']) )
+            for entry in ans['data'] :
+
+                filename    = entry['filename']
+                is_dir      = entry.get('is_dir',False)
+                modify_time = entry.get('modify_time_',0)
+                file_size   = entry.get('file_size','?')
+                owner       = entry.get('owner','?')
+                group       = entry.get('group','?')
+                file_permission = entry.get('file_permission','')
+
+                if args.escape :
+                    filename = filename.replace("\n",r'\n').replace("\t",r'\t').replace("\\",r'\\')
+
+                # Truncate owner and group to 10 character using + to indicate truncation.
+                if len(owner)>10 :
+                    owner=owner[0:9]+'+'
+                if len(group)>10 :
+                    group=group[0:9]+'+'
+
+                if len(file_permission) ==  3:
+                    mode = \
+                        octal_to_rwx.get(file_permission[0],'???')+\
+                        octal_to_rwx.get(file_permission[1],'???')+\
+                        octal_to_rwx.get(file_permission[2],'???')
+                else:
+                    mode='?????????'
+
+                if is_dir:
+                    mode='d' + mode
+                    filename=filename+'/'
+                else:
+                    mode='-' + mode
+
+                print('{:10} {:10} {:10} {:12} {} {}'.format(mode, owner, group, file_size, modify_time, filename) )
+
+        elif args.mode == 'short' :
+            sep=''
+            for entry in ans['data'] :
+                filename    = entry['filename']
+                if args.escape :
+                    filename = filename.replace("\n",r'\n').replace("\t",r'\t').replace("\\",r'\\')
+                print(sep,end="")
+                print(filename,end="")
+                if args.null:
+                    sep="\0"
+                else:
+                    sep="\n"
+        elif args.mode == 'full' :
+            pprint.pprint(ans)
+        elif args.mode == 'raw' :
+            sys.stdout.buffer.write(r.content)
+        else:
+            raise "Unhandled mode"
+
+# Custom argparse action to load a credential file.
+# The file shall contains 3 lines for the account, password and url.
+#
+# When they are not empty, the values will overwrite the
+# option '--account', '--password' and '--url' 
+# 
+class LoadCredentials(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):                    
+        super().__init__(option_strings, dest, **kwargs)
+    def __call__(self, parser, namespace, value, option_string=None):
+        # print('%r %r %r' % (namespace, value, option_string))
+        assert hasattr(namespace, "main_account")
+        assert hasattr(namespace, "main_password")
+        assert hasattr(namespace, "main_url")
+        with open(value,"r") as f:
+            account  = f.readline().rstrip('\n')
+            password = f.readline().rstrip('\n')
+            url      = f.readline().rstrip('\n')
+            if account:
+                setattr(namespace,'main_account', account)
+            if password:
+                setattr(namespace,'main_password', password)
+            if url:
+                setattr(namespace,'main_url', url)
 
 def main():
     global URI, ACCOUNT, PASSWORD 
 
     try:
-        # Parse the options but only up to the command name
-        opts, more_args = getopt.getopt(sys.argv[1:],
-                                        "hdvA:P:U:C:",
-                                        [ "help",
-                                          "debug",
-                                          "verbose",
-                                          "account=",
-                                          "password=",
-                                          "credentials=",
-                                          "url="
-                                         ])
-            
-        for opt, value in opts:
-            if opt in ("-h", "--help"):
-                usage()
-                sys.exit()
-            elif opt in ("-d", "--debug"):
-                HTTPConnection.debuglevel = 1
-            elif opt in ("-v", "--verbose"):
-                if True:
-                    logging.basicConfig(
-                        # filename='LOG.txt', filemode='w',
-                        stream=sys.stderr,
-                        level=logging.DEBUG,
-                        format='[%(levelname)s:%(name)s]  %(message)s',
-                    )
-                url3_log = logging.getLogger('urllib3')
-                url3_log.setLevel(logging.DEBUG)
-                url3_log.propagate = True
-            elif opt in ("-A", "--account"):
-                ACCOUNT=value
-            elif opt in ("-P", "--password"):
-                PASSWORD=value
-            elif opt in ("-U", "--url"):
-                URL=value
-            elif opt in ("-C", "--credential"):
-                with open(value,"r") as f:
-                    str=f.readline().rstrip('\n')
-                    if str:
-                        ACCOUNT=str
-                    str=f.readline().rstrip('\n')
-                    if str:
-                        PASSWORD=str
-                    str=f.readline().rstrip('\n')
-                    if str:
-                        URL=str
-            else:
-                assert False, f"Unhandled option '{opt}'"
+        parser = argparse.ArgumentParser(description='Execute actions using the ADM Portal Web interface',
+                                         usage='nas-cmd.py [OPTION...] ACTION ...',
+                                         epilog=
+                                         "Use ACTION -h for a detailed description of the arguments\n" \
+                                         "supported by each action.",
+                                         formatter_class=argparse.RawTextHelpFormatter
+                                         )
+        # Note: Use 'main_' prefix for all attributes to avoid conflicts with action arguments.     
+        parser.add_argument('-A', '--account', type=str, metavar='NAME', required=False, default=None,
+                            dest='main_account', 
+                            help='Set the ADM account name')
+        parser.add_argument('-P', '--password', type=str, metavar='TEXT', required=False, default=None,
+                            dest='main_password',
+                            help='Set the ADM password')
+        parser.add_argument('-U', '--url', type=str, metavar='HTTP', required=False, default=None,
+                            dest='main_url',
+                            help='Set the ADM url (e.g. https://hostname:port/) ')
+        parser.add_argument('-C', '--credentials', type=str, metavar='FILE', required=False, default=None,
+                            action=LoadCredentials,
+                            help='Read ADM account, password and url from a file')
+        parser.add_argument('-d', '--http-debug', action='store_true',
+                            dest='main_http_debug',
+                            help='Enable debug output in HTTPConnection')
+        parser.add_argument('-l', '--logging-debug', action='store_true',
+                            dest='main_logging_debug',
+                            help='Enable debug in logging')
+        
+        subparsers = parser.add_subparsers(title='Possible ACTIONs are',
+                                           dest='main_action',
+                                           required=True,
+                                           metavar='',
+                                           #description=':',
+                                           # help="an action amongst ",
+                                           ) 
 
-        if not more_args:
-            err_print("No action specified") 
-            usage_main()
-            sys.exit(1)
+        # Instanciate all known actions and their sub-argument parser
+        CatAction('cat',subparsers) 
+        DownloadAction('download',subparsers) 
+        LoginInfoAction('login_info',subparsers)
+        ListDirectoryAction('ls',subparsers,'short') 
+        ListDirectoryAction('ll',subparsers,'long') 
+        QueryAction('query',subparsers) 
+        UploadAction('upload',subparsers) 
+        
+        a = parser.parse_args() 
+
+        if a.main_logging_debug :
+            logging.basicConfig(
+                # filename='LOG.txt', filemode='w',
+                stream=sys.stderr,
+                level=logging.DEBUG,
+                format='[%(levelname)s:%(name)s]  %(message)s',
+            )
+            url3_log = logging.getLogger('urllib3')
+            url3_log.setLevel(logging.DEBUG)
+            url3_log.propagate = True
+
+        if a.main_http_debug:
+            HTTPConnection.debuglevel = 1
+
+        if a.main_url:
+            URL=a.main_url
+        if a.main_account:
+            ACCOUNT=a.main_account
+        if a.main_password:
+            PASSWORD=a.main_password
             
         err=0
             
         nas = NasPortal()
-        nas.login(URL, ACCOUNT, PASSWORD)
-            
-        action = more_args[0]
-        if action == "login":
-            # Print the JSON response from login
-            pprint.pprint(nas.login_info)
-        elif action in ( "ls", "dir", 'll', 'vdir' ) :
-            err = action_list_directory(nas, more_args)
-        elif action == "download":
-            err = action_download(nas, more_args)
-        elif action == "cat":
-            err = action_cat(nas, more_args)
-        elif action == "upload":
-            err = action_upload(nas, more_args)
-        elif action == "query":
-            err = action_query(nas, more_args)
-        else:
-            err_print(f"Unknown command '{action}' ") 
-            usage_main()
-            sys.exit(1)
-    
-        nas.logout()            
-        sys.exit(err)
 
-    except getopt.GetoptError as err:
-        err_print(err) 
-        usage_main()
-        sys.exit(1)
+        nas.login(URL, ACCOUNT, PASSWORD)
+        action = Action.find(a.main_action)
+        err = action.run(nas,a)
+        nas.logout
+ 
+        sys.exit(err)
 
     except FileNotFoundError:
         err_print(e) 
@@ -738,7 +779,7 @@ def main():
         if error_msg:
            msg += f" '{error_msg}'"        
         err_print(msg)
-        # Addition fields may exists. Warn about them
+        # Warn about additional fields in error response
         more_keys=set(e.json.keys())
         more_keys.discard('success')
         more_keys.discard('error_msg')
