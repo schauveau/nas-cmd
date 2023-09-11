@@ -56,12 +56,14 @@ The Web Developper Tool tells us that this operation involves two CGI requests:
   1. upload the key with `/portal/apis/accessControl/importkey.cgi`  
     - 'act=import_key'
     - The key file is attached in the request body 
-	-----------------------------122634777528959909511907845980
-	Content-Disposition: form-data; name="files"; filename="MyEncryptedShare.key"
-	Content-Type: application/vnd.apple.keynote
-	
-       	...(SOME RANDOM DATA HERE)... 
-	-----------------------------122634777528959909511907845980--
+```
+-----------------------------122634777528959909511907845980
+Content-Disposition: form-data; name="files"; filename="MyEncryptedShare.key"
+Content-Type: application/vnd.apple.keynote
+
+...SOME RANDOM DATA HERE... 
+-----------------------------122634777528959909511907845980--
+
   2. perform the actual mount with `/portal/apis/accessControl/share.cgi` 
     - `act=mount`
     - `name:=MyEncryptedShare
