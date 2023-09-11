@@ -18,16 +18,16 @@ from pathlib import Path, PurePosixPath
 
 from http.client import HTTPConnection
 
+ACCOUNT='foobar'
+PASSWORD='xxxxxxxx'
+URL="https://nas.schauveau.local:49124"
+
+
 LOGGER = logging.getLogger('nas-cmd')
 
 # Disable warning when using insecure https connection
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-URL="https://nas.schauveau.local:49124"
-ACCOUNT='foobar'
-PASSWORD='xxxxxxxx'
-
-p = None
 
 #
 # Escape some characters in string str 
@@ -45,6 +45,27 @@ def full_class_name(o):
         return n
     else:
         return m + '.' + n
+
+# Guess the content type from a filename.
+#
+# This is a very crude implementation.
+#
+# In practice that should not matter much except for a few CGI scripts
+# such as /portal/apis/wallpaper/uploadwallpaper.cgi that require a JPG
+# or PNG image. 
+#
+def guess_content_type(filename):
+    name = filename.lower()
+    matches = (
+        ( '.jpeg', 'image/jpeg' ),        
+        ( '.jpg', 'image/jpg' ),        
+        ( '.png', 'image/png' ), 
+        ( '.txt', 'text/plain' ),
+    )
+    for case in matches:
+        if name.endswith(matches[0]) :
+            return matches[1]
+    return 'application/octet-stream'
 
 # Simple wrapper to print to stderr instead of stdout    
 def err_print(*args,**kwargs):
@@ -320,9 +341,10 @@ class UploadAction(Action):
                                         'act': 'upload',
                                         'overwrite': 1,  # 0=skip 1=overwrite
                                         'path': args.dest,
-                                        'filesize': len(payload),
+                                        # 'filesize': len(payload),  # Not really needed?
                                     },
-                                    files = { 'file': (filename,  payload , "text/plain")  } )
+                                    files = { 'file': (filename,  payload , "application/octet-stream")  }
+                                   )
 
         
 class DownloadAction(Action):
@@ -454,17 +476,27 @@ class QueryAction(Action):
                           description='Perform a custom cgi query',
                           epilog=\
                           "\n"\
-                          "Parameter specifications of the form name=value are sent in the query string \n"\
-                          "while those of the form name:=value are sent in the body. \n"\
+                          "Each spec should be of one of the following forms:\n"\
+                          "   name=value to pass a argument in the URL (i.e. GET)\n"\
+                          "   name:=value to pass a argument in the body (i.e. POST)\n"\
+                          "   name@=filename to attach a file to the request\n"\
                           "\n"\
                           "The 'sid' argument is implictly passed and should not be specified here\n"\
                           ,
                           formatter_class=argparse.RawTextHelpFormatter
                          )
-        self.parser.add_argument('-i', '--info', action='store_true',
-                                help='print summary information instead')
+        self.parser.add_argument('-i', '--ignore-response', action='store_true',
+                                help='Do not attempt to interpret response (silent)')
+        self.parser.add_argument('-H', '--show-headers', action='store_true',
+                                help='Print the response headers ')
         self.parser.add_argument('-r', '--raw', action='store_true',
-                                 help="print the raw response")
+                                 help="Print the raw response content")
+        self.parser.add_argument('-o', '--output', type=str, metavar='FILE',required=False, default=None, 
+                                 help="Save the response content to file")
+        self.parser.add_argument('-s', '--save-headers', type=str, metavar='FILE',required=False, default=None, 
+                                 help="Save the response headers to file")
+        self.parser.add_argument('-c', '--content-type', type=str, metavar='STR',required=False, default=None, 
+                                 help="Set the content type for all file specifications")
         self.parser.add_argument('cgi',
                                  help="path to the cgi file")
         self.parser.add_argument('spec', nargs='*',
@@ -472,42 +504,84 @@ class QueryAction(Action):
        
     def run(self, nas, args):
 
-        if not ( a.cgi.startswith('/portal/apis/') and a.cgi.endswith('.cgi') ) :
+        cgi = args.cgi
+        if not ( cgi.startswith('/portal/apis/') and cgi.endswith('.cgi') ) :
             err_print("cgi should be of the form '/portal/apis/.../FILE.cgi'")
             sys.exit(2)
 
-        # Transform each param_spec into an entry in params or in data 
+        # Transform each param_spec into an entry in params, data or files
         params={}
         data={}
-        re_spec=re.compile("^([a-zA-Z_][a-zA-Z_0-9]*)(=|:=)(.*)$")
-        for spec in a.spec:
+        files={}
+        re_spec=re.compile("^([a-zA-Z_][a-zA-Z_0-9]*)(=|:=|@=)(.*)$")
+        for spec in args.spec:
             m = re_spec.match(spec)
             if not m:
                 err_print(f"unexpected argument {spec}. Expect name=value or name:=value")
                 sys.exit(1)
-            if m.group(1) == 'sid':
+            name=m.group(1)
+            sep=m.group(2)
+            value=m.group(3)
+            if name == 'sid':
                 err_print(f"Warning: Ignoring sid parameter")
                 continue
-            if m.group(2) == '=' :
+            if sep == '=' :
                 params[m.group(1)] = m.group(3) 
-            elif m.group(2) == ':=' :
+            elif sep == ':=' :
                 data[m.group(1)] = m.group(3) 
+            elif sep == '@=' :
+                filename=m.group(3)
+                if args.content_type:
+                    content_type=args.content_type
+                else:
+                    content_type=guess_content_type(filename)
+                    err_print(f"Warning: No content type specified. Guessing {content_type}")
+                    
+                with open(filename,"rb") as f:
+                    files[m.group(1)] = ( Path(filename).name , f.read(), content_type )
             else:
                 assert False
 
-        r, json = nas.request_json( 'POST',
-                                    a.cgi,
-                                    json_raise_on_error=False,  
-                                    json_or_attachment=True,    
-                                    params = params,
-                                    data = data
-                                   )
-        if a.raw:        
-            sys.stdout.buffer.write(r.content)
-        else:
-            pprint.pprint(json)
+        r = nas.request('POST',
+                        cgi,
+                        params = params,
+                        data   = data,
+                        files  = files
+                        )
 
+        if args.output:
+            with open(args.output, "wb") as out:
+                out.write(r.content)
+        
+        if args.show_headers:
+            for key in sorted(r.headers.keys()):
+                print(f"{key}: {r.headers[key]}")
+            print("")        
+            
+        if args.save_headers:
+            with open(args.save_headers, "w") as out:
+                for key in sorted(r.headers.keys()):
+                    print(f"{key}: {r.headers[key]}",file=out)
+            
+        if args.ignore_response:
+            return 0        
+        
+        if args.raw:        
+            sys.stdout.buffer.write(r.content)
+            return 0
+        
+        print(f"Response contains {len(r.content)} bytes")
+        
+        content_disposition = r.headers.get('Content-Disposition','')
+        if content_disposition.startswith('attachment;'):
+            print(f"Attachement detected: {content_disposition}. ")                
+            return 0
+        else:
+            print(f"Interpreting response as JSON")                
+            j = nas.response_as_json( r, False )
+            pprint.pprint(j)
         return 0
+        
 
 
 class LoginInfoAction(Action):
@@ -525,6 +599,18 @@ class LoginInfoAction(Action):
             sys.stdout.buffer.write(nas.login_content)
         else:
             pprint.pprint(nas.login_info)
+        
+class NopAction(Action):
+    
+    def __init__(self, name, subparser):
+        super().__init__( name, subparser,
+                          help='Do nothing except login/logout',
+                          description='Do nothing except login/logout'
+                          )
+       
+    def run(self, nas, args):
+        print('ok')
+        return 0
         
 class ListDirectoryAction(Action):
     
@@ -597,7 +683,7 @@ class ListDirectoryAction(Action):
 
                 filename    = entry['filename']
                 is_dir      = entry.get('is_dir',False)
-                modify_time = entry.get('modify_time_',0)
+                modify_time = entry.get('modify_time','?')
                 file_size   = entry.get('file_size','?')
                 owner       = entry.get('owner','?')
                 group       = entry.get('group','?')
@@ -626,7 +712,7 @@ class ListDirectoryAction(Action):
                 else:
                     mode='-' + mode
 
-                print('{:10} {:10} {:10} {:12} {} {}'.format(mode, owner, group, file_size, modify_time, filename) )
+                print('{:10} {:10} {:10} {:12} {:16} {}'.format(mode, owner, group, file_size, modify_time, filename) )
 
         elif args.mode == 'short' :
             sep=''
@@ -673,7 +759,7 @@ class LoadCredentials(argparse.Action):
                 setattr(namespace,'main_url', url)
 
 def main():
-    global URI, ACCOUNT, PASSWORD 
+    global URL, ACCOUNT, PASSWORD 
 
     try:
         parser = argparse.ArgumentParser(description='Execute actions using the ADM Portal Web interface',
@@ -706,7 +792,7 @@ def main():
         subparsers = parser.add_subparsers(title='Possible ACTIONs are',
                                            dest='main_action',
                                            required=True,
-                                           metavar='',
+                                           metavar='ACTION',
                                            #description=':',
                                            # help="an action amongst ",
                                            ) 
@@ -717,6 +803,7 @@ def main():
         LoginInfoAction('login_info',subparsers)
         ListDirectoryAction('ls',subparsers,'short') 
         ListDirectoryAction('ll',subparsers,'long') 
+        NopAction('nop',subparsers) 
         QueryAction('query',subparsers) 
         UploadAction('upload',subparsers) 
         
