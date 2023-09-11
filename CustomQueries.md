@@ -6,20 +6,21 @@ This is not that hard to do assuming that you are using a web browser with decen
 
 # How to proceed?
 
+Let's do it with an example ; for instance let's figure out how to mount/unmount an encrypted share.
 
-Let's do it with an example ; for instance how to mount/unmount an encrypted share.
+We need a Web browser with builtin developper tools to inspect the HTTP messages. I will be using Firefox but the procedure should basically be the same with Chrome.
 
-We need a Web browser with builtin developper tools to inspect the HTTP exchanges. I am using Firefox but the procedure should basically be the same with Chrome.  
+First, connect to the ADM portal with an administrator account and open the `Shared Folders` tab in the `Access Control` window. if you do not have one, create a new encrypted folder.
 
-First, connect to the ADM portal in Firefox with an administrator account and open the `Shared Folders` tab in the `Access Control` window. Create a new encrypted if you do not have one.
-
-Now use `SHIFT+CONTROL+i` to open the Web Developper Tool and select the Network tab. You can type `.cgi` in the `Filter URLS` area to only show the cgi requests (and not the other downloads). 
+Now use `SHIFT+CONTROL+i` to open the *Web Developper Tool* and select the *Network* tab. You can type `.cgi` in the `Filter URLS` area to only show the cgi requests (and not the other downloads). 
 
 In the `Access Control` window, mount an encrypted folder. A few cgi requested should appear. The interesting one should look like
 
-	https://nas.schauveau.local:49124/portal/apis/accessControl/share.cgi?sid=l8v-ZHTEMFfxGn5t&act=mount&_dc=1694421221520
+```
+https://nas.schauveau.local:49124/portal/apis/accessControl/share.cgi?sid=l8v-ZHTEMFfxGn5t&act=mount&_dc=1694421221520
+```
 
-Select that line to show more details about that request.
+Select that line to display more details about that request.
 
 The arguments after `/portal/apis/accessControl/share.cgi` are:
   - `sid` is the connection identifier. It can be ignored since the script will take care of that.
@@ -30,7 +31,7 @@ A quick look in the `Request` tab tells us that 2 more arguments are passed as f
   - `name=MyEncryptedShare`
   - `encrypt_key=my_secret_password`
 
-This is enough to reproduce that 'mount' action. Make sure that the share is not mounted and try
+This is enough to reproduce that 'mount' action. Make sure that the share is not mounted and try the following using your administrator credentials:
 
 ```
 # nas-cmp.py query /portal/apis/accessControl/share.cgi act=mount name:=MyEncryptedShare encrypt_key:=my_secret_password
@@ -39,9 +40,9 @@ Interpreting response as JSON
 {'success': True}
 ```
 
-*Remark:* If the query is not successful then the JSON answer will contain an `error_code` and an `error_msg` that may or may not help you figure out what when wrong. Remember that this API was not intended for humans and is undocumented.
+*Remark:* If the query is not successful then the JSON answer will contain an `error_code` and an `error_msg` that may or may not help you figure out what when wrong. Remember that this API was not intended for humans and is undocumented. Each CGI script has its own set of error codes. 
 
-In practice, most CGI scripts do not care if their arguments are passed in the URL (as `name=value`) or in form-data (as `name:=value`) but it is probably wiser to pass sensitive information in form-data where they are less visible. A notable exception is `act` that has to be passed in the URL.
+*Remark:* Most CGI scripts do not care if their arguments are passed in the URL (as `name=value`) or in form-data (as `name:=value`) but it is probably wiser to pass sensitive information in form-data. A notable exception is `act` and `sid` that must to be passed in the URL.
 
 The query to unmount the encrypted share is similar but with `act=unmount` and argument `name_list` instead of `name` 
 
@@ -66,7 +67,7 @@ Content-Type: application/vnd.apple.keynote
 ```
   2. perform the actual mount with `/portal/apis/accessControl/share.cgi` 
      - `act=mount`
-     - `name:=MyEncryptedShare
+     - `name:=MyEncryptedShare`
      - `import_key_file:=MyEncryptedShare.key`
 
 We can use a specification of the form `name@=file` to create the attachment.
@@ -76,10 +77,10 @@ We can use a specification of the form `name@=file` to create the attachment.
 The corresponding queries are
 
 ```
-# nas-cmd.py query /portal/apis/accessControl/importkey.cgi  act=import_key files@=MyEncryptedShare.key 
+# nas-cmd.py query /portal/apis/accessControl/importkey.cgi  act=import_key files@=../private/MyEncryptedShare.key 
 Response contains 41 bytes
 Interpreting response as JSON
-{'name': 'ZZZZZ.key', 'success': True}
+{'name': 'MyEncryptedShare.key', 'success': True}
         
 # nas-cmd.py query /portal/apis/accessControl/share.cgi act=mount name=MyEncryptedShare import_key_file:=MyEncryptedShare.key
 Response contains 20 bytes
