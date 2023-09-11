@@ -535,7 +535,7 @@ class QueryAction(Action):
                     content_type=args.content_type
                 else:
                     content_type=guess_content_type(filename)
-                    err_print(f"Warning: No content type specified. Guessing {content_type}")
+                    # err_print(f"Warning: No content type specified. Guessing {content_type}")
                     
                 with open(filename,"rb") as f:
                     files[m.group(1)] = ( Path(filename).name , f.read(), content_type )
@@ -841,11 +841,11 @@ def main():
  
         sys.exit(err)
 
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         err_print(e) 
         sys.exit(2)
         
-    except PermissionError:
+    except PermissionError as e:
         err_print(e) 
         sys.exit(2)
         
