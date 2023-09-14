@@ -12,6 +12,8 @@ import time
 import os
 import logging
 import hashlib
+import atexit
+import json
 
 # Will use Path for local files and directories and PurePosixPath for the remote ones 
 from pathlib import Path, PurePosixPath
@@ -73,7 +75,7 @@ def err_print(*args,**kwargs):
         kwargs['file']=sys.stderr
     print(*args,**kwargs)
     
-class NasPortalMalformedJsonError(IOError):
+class NasSessionMalformedJsonError(IOError):
     """Bad or malformed JSON found in response"""
 
     def __init__(self, msg,  json, response):
@@ -81,7 +83,7 @@ class NasPortalMalformedJsonError(IOError):
         self.response = response
         super().__init__(msg)
 
-class NasPortalResponseError(IOError):
+class NasSessionResponseError(IOError):
     """JSON response describes an error"""
 
     def __init__(self, json, response):
@@ -89,10 +91,56 @@ class NasPortalResponseError(IOError):
         self.response = response
         super().__init__("Portal response describes an error")
 
-class NasPortalNotConnectedError(Exception):
-    """No SID available in NasPortal (not logged in yet?)"""
+class NasSessionNotConnectedError(Exception):
+    """No SID available in NasSession (not logged in yet?)"""
 
-class NasPortal: 
+    
+# Perform sanity checks on a Requests response and interpret it as JSON.
+#
+# :param  response: a requests.Response object
+# :param  raise_on_error: boolean to indicate if NasSessionResponseError should 
+#         be raised when JSON response describes an error.
+#         If of type integer, tuple, list then those are the error codes that
+#         should NOT RAISE NasSessionResponseError.
+# :raises requests.exceptions.RequestException: Any exception that
+#         may be triggered by response.raise_for_status()     
+# :raises requests.JSONDecodeError: If the response body does not
+#         contain valid json.
+# :raises NasSessionMalformedJsonError: If the JSON response does not
+#         contain a boolean 'success' field.
+# :raises NasSessionResponseError: If the JSON contains an error. 
+# 
+# 
+def get_json_from_response(response, raise_on_error=True):
+    #
+    # TODO: Check the response headers to insure that the  
+    #       response payload is not user data (e.g. a download request).
+    #       We do not want to interpet user-json as adm-json
+    #
+    json = response.json()
+    success = json.get("success",None)
+    if success is None:
+        raise NasSessionMalformedJsonError("No success field in JSON response",json,response)
+    elif success is False:
+        if type(raise_on_error) is bool :
+            do_raise = raise_on_error
+        elif type(raise_on_error) is tuple or type(raise_on_error) is list :
+            do_raise = not ( json.get("error_code",None) in raise_on_error ) 
+        elif type(raise_on_error) is int :
+            do_raise = json.get("error_code",None) != raise_on_error
+        if do_raise:
+            raise NasSessionResponseError(json, response)
+    elif success is True:
+        pass
+    else:
+        raise NasSessionMalformedJsonError("Unexpected value in success field of JSON response",json,response)        
+    return json   
+
+#
+# Provide a requests.Session to an Asustor Portal and basic login, logout and request  
+# features.
+#
+class NasSession: 
 
     def __init__(self):
         self.url = None
@@ -104,56 +152,18 @@ class NasPortal:
         self.session.verify = False 
 
     def __del__(self):
-
-        if self.connected() :
-            self.logout()
+        self.logout()
             
         
     def connected(self):
         return (self.sid != None)
 
-
-    # Perform sanity checks on a Requests response and return the
-    # JSON answer. 
-    #
-    # :param  response: a requests.Response object
-    # :param  raise_on_error: If true then raises NasPortalResponseError
-    #         when JSON describes an error (i.e. when 'success' is false )
-    # :raises requests.exceptions.RequestException: Any exception that
-    #         may be triggered by response.raise_for_status()     
-    # :raises requests.JSONDecodeError: If the response body does not
-    #         contain valid json.
-    # :raises NasPortalMalformedJsonError: If the JSON response does not
-    #         contain a boolean 'success' field.
-    # :raises NasPortalResponseError: If the JSON contains an error. 
-    # 
-    # 
-    def response_as_json(self, response, raise_on_error=True):
-        #
-        # TODO: Check the response headers to insure that the  
-        #       response payload is not user data (e.g. a download request).
-        #       We do not want to interpet user-json as adm-json
-        #
-        json = response.json()
-        success = json.get("success",None)
-        if success is None:
-            raise NasPortalMalformedJsonError("No success field in JSON response",json,response)
-        elif success is False:
-            if raise_on_error:
-                raise NasPortalResponseError(json, response)
-        elif success is True:
-            pass
-        else:
-            raise NasPortalMalformedJsonError("Unexpected value in success field of JSON response",json,response)        
-        return json   
-
-    # return the current connection SID or raise NasPortalNotConnectedError 
+    # return the current connection SID or raise NasSessionNotConnectedError 
     def get_connection_sid(self):
         if self.sid is None:
-            raise NasPortalNotConnectedError
+            raise NasSessionNotConnectedError
         return self.sid
 
-    
     # Wrapper around requests.Session.request
     #
     # The arguments are basically the same except that the second positional
@@ -161,7 +171,7 @@ class NasPortal:
     # '/portal/apis/foobar.cgi')
     #
     # :raises Any exception raised by requests.Session.request 
-    # :raises NasPortalNotConnectedError if self.sid is None and no 'sid' is found
+    # :raises NasSessionNotConnectedError if self.sid is None and no 'sid' is found
     #         in 'params'. That typically indicates that no login was performed.
     # 
     def request(self, method, cgi, **kwargs):
@@ -187,7 +197,7 @@ class NasPortal:
     # The following additional named arguments are recognized
     #
     # - json_raise_on_error  (default True)
-    #      if True then raise NasPortalResponseError when the
+    #      if True then raise NasSessionResponseError when the
     #      JSON 'success' field is false. 
     # - json_or_attachment (default False)
     #      if True then either an attachment or JSON is possible.
@@ -206,10 +216,8 @@ class NasPortal:
                 if r.headers['Content-Disposition'].startswith('attachment;'):
                     return r, None
         
-        j = self.response_as_json( r, json_raise_on_error )        
+        j = get_json_from_response( r, json_raise_on_error )        
         return r,j
-    
-  
     
     def login(self, url, account, passwd):
         r"""Log in ADM portal.
@@ -242,44 +250,31 @@ class NasPortal:
             self.home = "/root"
         else:
             self.home = f"/home/{account}"
-            
+
+        # If the program terminates early (e.g. with sys.exit()), the NasSession destructor may
+        # be called after the connections are closed. Let's make sure that we logout as
+        # soon as possible.
+        atexit.register(NasSession.logout, self)
             
     def logout(self):
         r"""Log out from ADM portal.
         """
+        if self.sid is None:
+            return
         #
-        # Make sure that the sid is always cleared even if the logout request fails.
-        # Of course, that means that we have to pass the 'old' sid explicitly to
-        # the request.
+        # Make sure that the sid is always cleared even when the logout request 
+        # raises an exception.
         #
-        old_sid=self.get_connection_sid() 
-
+        sid = self.sid
         self.sid=None  
         r = self.request( 'POST',
                           "/portal/apis/login.cgi",
                           params = {
-                              'sid': old_sid,
+                              'sid': sid,
                               'act':'logout'
                           }
                          )
 
-    def dump_json_answer(self,r):
-        print(f"#### {r.status_code} {r.url}")
-        pprint.pprint(r.json())
-
-    def dump_response(self,r):
-        if isinstance(r, Exception):
-            print(f"An exception occured : {r}" )
-        elif isinstance(r, requests.Response):
-            print(f"#### {r.status_code} {r.url}")        
-            try:
-                j = r.json()
-            except Exception as ex:
-                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
-                message = template.format(type(ex).__name__, ex.args)
-                print(message)
-        else:
-            print("Unexpected reponse type : ",type(r))
 
 # Base class to implement ADM actions
 #
@@ -296,55 +291,388 @@ class Action:
     @staticmethod
     def find(name) :
         return Action.all_instances[name]
+
+# Describe an argument     
+class Argument:
+    # 
+    # *options are strings for the option names (e.g. '-k', '--keep', 'src'). They will later be passed to parser.add_argument()
+    #
+    # All remaining arguments (in **kwargs) will later be passed to parser.add_argument()
+    #
+    def __init__(self, *options, **kwargs):
+        self.options = options
+        self.kwargs = kwargs
+
+    def add_to_parser(self, parser):
+        # print("[add_to_parser]",self.options,self.kwargs)
+        parser.add_argument(*self.options, **self.kwargs) 
         
-class UploadAction(Action):
+        
+ARG_HEADERS = Argument('--headers',
+                       dest='headers',
+                       action='store_true',
+                       help='Print the response headers',
+                       )
+
+ARG_RAW = Argument('--raw',
+                   dest='raw',
+                   action='store_true',
+                   help="Print the raw response content and stop"
+                   )
+
+ARG_SAVE = Argument('--save',
+                    dest='save',
+                    type=str,
+                    metavar='FILE',
+                    required=False,
+                    default=None, 
+                    help="Save the response content to file"
+                    )
+        
+ARG_SAVE_HEADERS = Argument('--save-headers',
+                            dest='save_headers',
+                            type=str,
+                            metavar='FILE',
+                            required=False,
+                            default=None, 
+                            help="Save the response headers to file"
+                            )
+
+ARG_STOP = Argument('--stop',                                   
+                    dest='stop',
+                    action='store_true',
+                    help='Stop after sending the CGI request'
+                    ) 
+
+#
+# Used by the hooks in BasicAction.run() to describe the current state 
+#
+class RunState:
+    def __init__(self, nas, args):
+        self.nas  = nas 
+        self.args = args
+        self.response = None
+        self.request_params = None
+        self.request_data = None
+        self.request_files = None
+        
+class BasicAction(Action):
+        
+    ARG_HEADERS = Argument('--headers',
+                           dest='headers',
+                           action='store_true',
+                           help='Print the response headers',
+                           )
+
+    ARG_RAW = Argument('--raw',
+                       dest='raw',
+                       action='store_true',
+                       help="Print the raw response content and stop"
+                       )
+
+    ARG_SAVE = Argument('--save',
+                        dest='save',
+                        type=str,
+                        metavar='FILE',
+                        required=False,
+                        default=None, 
+                        help="Save the response content to file"
+                        )
+
+    ARG_SAVE_HEADERS = Argument('--save-headers',
+                                dest='save_headers',
+                                type=str,
+                                metavar='FILE',
+                                required=False,
+                                default=None, 
+                                help="Save the response headers to file"
+                                )
+
+    ARG_STOP = Argument('--stop',                                   
+                        dest='stop',
+                        action='store_true',
+                        help='Stop after sending the CGI request'
+                        ) 
+
+    DEFAULT_ARGS = [
+        ARG_SAVE,
+        ARG_SAVE_HEADERS,
+        ARG_HEADERS,
+        ARG_RAW,
+        ARG_STOP,
+    ]
+    
+    def __init__(self, name, subparser, cgi=None, params={} , data={}, files={}, args=DEFAULT_ARGS, **kwargs):
+        super().__init__( name,
+                          subparser,
+                          formatter_class=argparse.RawTextHelpFormatter,
+                          **kwargs
+                         )
+        
+        self.cgi = cgi
+        self.params_spec = params
+        self.data_spec   = data
+        self.file_spec   = files
+
+        for a in args:
+            a.add_to_parser(self.parser)
+
+
+    def run(self, nas, args):
+        state = RunState(nas,args)
+        
+        ok = self.start_hook(state)
+        assert type(ok)==bool 
+        if not ok:
+            return False 
+        
+        state.request_params  = {}
+        for name, spec in self.params_spec.items():
+            # TODO
+            state.request_params[name] = spec             
+
+        state.request_data = {}
+        for name, spec in self.data_spec.items():
+            # TODO
+            state.request_data[name] = spec        
+
+        state.request_files = {}
+        # TODO
+        
+        ok = self.before_request_hook(state) 
+        assert type(ok)==bool 
+        if not ok:
+            return False
+
+        if not self.cgi:
+            raise Exception("No CGI specified")
+        
+        state.response = nas.request('POST',
+                                     self.cgi,
+                                     params = state.request_params,
+                                     data   = state.request_data,
+                                     files  = state.request_files
+                                     )
+        
+        ok = self.after_request_hook(state)
+        assert type(ok)==bool 
+        if not ok:
+            return False
+        
+        if state.args.save:
+            with open(args.output, "wb") as out:
+                out.write(state.response.content)
+        
+        if state.args.headers:
+            for key in sorted(state.response.headers.keys()):
+                print(f"{key}: {state.response.headers[key]}")
+            print("")
+            
+        if state.args.save_headers:
+            with open(state.args.save_headers, "w") as out:
+                for key in sorted(state.response.headers.keys()):
+                    print(f"{key}: {state.response.headers[key]}",file=out)
+            
+        if state.args.raw:
+            sys.stdout.buffer.write(state.response.content)
+            return 0
+    
+        if state.args.stop:
+            return 0 
+        
+        ok = self.end_hook(state)
+        assert type(ok)==bool 
+        if not ok:
+            return False
+        
+    # Executed at the start of self.run() 
+    def start_hook(self, state: RunState):
+        return True
+
+    # Executed in self.run() before the CGI request in self.run()
+    def before_request_hook(self, state: RunState):
+        return True
+
+    # Executed in self.run() after the CGI request in self.run()
+    def after_request_hook(self, state: RunState):
+        return True
+    
+    # Executed in self.run() after processing the DEFAULT_ARGS 
+    def end_hook(self, state: RunState):
+
+        r = state.response
+        # Handle the two cases encountered so far
+        #
+        # - an file attachement indicated by the presence of
+        #   a 'Content-Disposition: attachment; ...' 
+        # - otherwise, no 'Content-Disposition' and
+        #   'Content-type: text/plain; charset=utf-8' indicates
+        #   that this is likely a JSON reply.  
+        #
+        content_size = len(r.content)
+        
+        # Look for an attached file
+        content_disposition = r.headers.get('Content-Disposition','none')
+        content_type = r.headers.get('Content-Type','none')
+        if content_disposition.startswith('attachment;'):
+            err_print(f"Attachement detected ({content_size} bytes): {content_disposition}. ")                
+            return True
+
+        # I do not think that this is possible but ... 
+        if content_size == 0:
+            err_print(f"Empty response")                
+            return True
+
+        if  content_disposition=='none' and \
+            content_type.startswith('text/html;'):
+            err_print(f"Html detected ({content_size})")                
+
+        # Then a JSON response
+        if  content_disposition=='none' and \
+            content_type.startswith('text/plain; charset=utf-8'):
+            # err_print(f"Interpreting response as JSON")
+            j = get_json_from_response( r, False )
+            json.dump(j, sys.stdout, indent=1, sort_keys=False)
+            return True
+
+        err_print("Warning: Unexpected response")
+        return False
+    
+class QueryAction(BasicAction):
     def __init__(self, name, subparser):
         super().__init__( name,
                           subparser,
+                          help='Perform a custom cgi query',
+                          description='Perform a custom cgi query',
+                          epilog=\
+                          "\n"\
+                          "Each spec should be of one of the following forms:\n"\
+                          "   name=value to pass an argument in the URL\n"\
+                          "   name:=value to pass an argument as form-data\n"\
+                          "   name@=filename to attach a file to the request\n"\
+                          "\n"\
+                          "The 'sid' argument is implictly managed and should not be specified here\n"\
+                          ,
+                          args = [
+                              BasicAction.ARG_SAVE,
+                              BasicAction.ARG_SAVE_HEADERS,
+                              BasicAction.ARG_HEADERS,
+                              BasicAction.ARG_RAW,
+                              BasicAction.ARG_STOP,
+                              Argument( '-c', '--content-type',
+                                        type=str,
+                                        metavar='STR',
+                                        required=False,
+                                        default=None, 
+                                        help="Set the content type for all file specifications"
+                                       ),
+                              Argument('cgi',
+                                       help="path to the cgi file"
+                                       ),
+                              Argument('spec',
+                                       nargs='*',
+                                       help="parameter specification of the form name=value or name:=value"
+                                       )
+                          ]
+                         )
+      
+    def before_request_hook(self, state: RunState):
+        
+        self.cgi = state.args.cgi
+        if not ( self.cgi.startswith('/portal/apis/') and self.cgi.endswith('.cgi') ) :
+            err_print("cgi should be of the form '/portal/apis/.../FILE.cgi'")
+            return False
+
+        # Transform each param_spec into an entry in params, data or files
+        re_spec=re.compile("^([a-zA-Z_][a-zA-Z_0-9]*)(=|:=|@=)(.*)$")
+        for spec in state.args.spec:
+            m = re_spec.match(spec)
+            if not m:
+                err_print(f"Error:unexpected argument {spec}. Expect name=value or name:=value")
+                return False
+            name=m.group(1)
+            sep=m.group(2)
+            value=m.group(3)
+            if name == 'sid':
+                err_print(f"Warning: Ignoring sid parameter")
+                continue
+            if sep == '=' :
+                state.request_params[m.group(1)] = m.group(3) 
+            elif sep == ':=' :
+                state.request_data[m.group(1)] = m.group(3) 
+            elif sep == '@=' :
+                filename=m.group(3)
+                if args.content_type:
+                    content_type=args.content_type
+                else:
+                    content_type=guess_content_type(filename)
+                    # err_print(f"Warning: No content type specified. Guessing {content_type}")
+                    
+                with open(filename,"rb") as f:
+                    state.request_files[m.group(1)] = ( Path(filename).name , f.read(), content_type )
+            else:
+                assert False  # Hoops! Something went wrong with the regex
+                
+        return True
+                    
+    def after_request_hook(self, state: RunState):
+        return True
+                     
+class UploadAction(BasicAction):
+    def __init__(self, name, subparser):
+        super().__init__( name,                          
+                          subparser,
+                          cgi='/portal/apis/fileExplorer/upload.cgi',
                           help='Upload a file to the NAS',
                           description='Upload a file',
                           epilog=\
                           "\n"\
                           "\n",
-                          formatter_class=argparse.RawTextHelpFormatter )
+                          args=[
+                              BasicAction.ARG_SAVE,
+                              BasicAction.ARG_SAVE_HEADERS,
+                              BasicAction.ARG_HEADERS,
+                              BasicAction.ARG_RAW,
+                              BasicAction.ARG_STOP,         
+                              Argument('src',
+                                       help="Local source file"
+                                       ),                              
+                              Argument('dest', 
+                                       help="Remote destination directory"
+                                       ),                                     
+                              Argument('filename',
+                                       nargs='?',
+                                       default=None,                        
+                                       help="The filename to create. Default is to reuse the name of src"
+                                       )
+                          ],
+                          params={
+                              'act': 'upload',
+                              'overwrite': 1,  # 0=skip 1=overwrite
+                          }
+                         )
         
-        self.parser.add_argument('src',
-                                 help="Source file")
-        
-        self.parser.add_argument('dest', 
-                                 help="Destination directory in an accessible share")
-        
-        self.parser.add_argument('filename',  nargs='?', default=None,                        
-                                 help="The filename to create. Default is to reuse\n"\
-                                 "the name of the source file"
-                                 )
-        
-    def run(self, nas, args):
-        src=Path(args.src)
+    def before_request_hook(self, state: RunState):
+
+        state.request_params['path'] = state.args.dest
+
+        src = Path(state.args.src)
         if not src.is_file() :
             err_print("specified src does not exist or is not a file")
-            sys.exit(1)
+            return False
 
         with src.open("rb") as f :
-            payload=f.read()
+            payload = f.read()
 
-        if not args.filename is None: 
-            filename = args.filename
+        if not state.args.filename is None: 
+            filename = state.args.filename
         else:
             filename = src.name
 
-        files = {'file': (filename,  payload , "text/plain") }
+        state.request_files['file'] = ( filename,  payload , "text/plain")         
 
-        r, json = nas.request_json( 'POST',
-                                    "/portal/apis/fileExplorer/upload.cgi",
-                                    params = {
-                                        'act': 'upload',
-                                        'overwrite': 1,  # 0=skip 1=overwrite
-                                        'path': args.dest,
-                                        # 'filesize': len(payload),  # Not really needed?
-                                    },
-                                    files = { 'file': (filename,  payload , "application/octet-stream")  }
-                                   )
+        return True
+        
 
         
 class DownloadAction(Action):
@@ -361,7 +689,7 @@ class DownloadAction(Action):
         self.parser.add_argument('-q', '--quiet', action='store_true',
                                  help='Be quiet in case of success')
         
-        self.parser.add_argument('src',  default='share', 
+        self.parser.add_argument('src',  default=None, 
                                  help="")
         
         self.parser.add_argument('dest', nargs='?', default=None,
@@ -410,179 +738,201 @@ class DownloadAction(Action):
 
         return 0
 
-class CatAction(Action):
+class CatAction(BasicAction):
     def __init__(self, name, subparser):
+
         super().__init__( name,
                           subparser,
+                          cgi="/portal/apis/fileExplorer/download.cgi",
                           help='Download and display a file',
                           description='Download and print a file to stdout',
                           epilog=\
                           "\n"\
                           "\n",
-                          formatter_class=argparse.RawTextHelpFormatter
+                          args = [
+                              *BasicAction.DEFAULT_ARGS ,
+                              Argument('--summary',
+                                       action='store_true',
+                                       dest='summary',
+                                       help='print summary information instead of full content'
+                                       ),
+                              Argument('target',
+                                       help='path to a remote file'
+                                       ),
+                          ],
+                          params={
+                              'act': 'download',
+                              'total': 1,
+                              'mod_cntype': 0,                              
+                              # 'path': src.parent,
+                              # 'file': src.name
+                          },
                          )
-        self.parser.add_argument('-i', '--info', action='store_true',
-                                 help='print summary information instead')
-        self.parser.add_argument('src',  default='share', 
-                                 help="")        
-    def run(self, nas, args):
+        
+        self.json_raise_on_error=True,
+        self.json_or_attachment=True,
 
-        # Detect an explicit directory syntax before it is simplified by PurePosixPath 
-        if args.src.endswith('/') or args.src.endswith('/.'):
-            err_print("src must be a file ; not a directoryy")
-            sys.exit(2)
+    def before_request_hook(self, state: RunState):
+
+        # We need to split the target argument into a path (i.e. the directory)
+        # and a filename.
+
+        target = PurePosixPath(state.args.target)
+        
+        state.request_params['path'] = target.parent,
+        state.request_params['file'] = target.name,
+
+        return True
             
-        src=PurePosixPath(args.src)
+    def end_hook(self, state: RunState):
 
-        if not src.is_absolute() :
-            err_print("src must be an absolute path")
-            sys.exit(2)
+        response = state.response 
+        content_disposition = response.headers.get('Content-Disposition','')
+        if content_disposition.startswith('attachment;'):
+            sys.stdout.buffer.write(response.content)
+            return True
 
-        r, json = nas.request_json( 'POST',
-                                    "/portal/apis/fileExplorer/download.cgi",
-                                    json_raise_on_error=True,
-                                    json_or_attachment=True,
-                                    params = {
-                                        'act': 'download',
-                                        'path': src.parent,
-                                        'total': 1,
-                                        'mod_cntype': 0,                              
-                                        'file': src.name
-                                    }
-                                   )
+        # The content must be a json error description.        
+        j = get_json_from_response(response, True)  
 
-        # The only JSON responses expected after a download request are error messages
-        # and they should raise an exception. Just to be sure ...
-        assert json is None
+        # Hummm... This is not a json error. Should not happen here
+        err_print(f"Unexpected JSON response:\n")
+        json.dump(j, sys.stderr, indent=1, sort_keys=False)
 
-        if args.info:
-            md5sum=hashlib.md5(r.content).hexdigest()
-            print(f"filename={repr(src.name)}")
-            print(f"directory={repr(str(src.parent))}")
-            print(f"size={len(r.content)}")
-            print(f"md5={md5sum}")
-        else:
-            sys.stdout.buffer.write(r.content)
+        return False
 
-        return 0
-
+#
+# Query the properties of the file or directory at path.
+#
+# In case of success, return a dict with the following fields
+# 
+#  'file_name'  the name of the file or directory
+#  'file_size'  the overall storage size 
+#  'files'      the number of files inside the directory 
+#  'folder'     the number of folders inside the directory
+#  'at'         the last access time (e.g. '2023-09-12 10:30')
+#  'ct'         the creation time (e.g. '2023-09-12 10:30')
+#  'mt'         the last modification time (e.g. '2023-09-12 10:30')
+#
+# If should be noted that there are no obvious ways to differentiate a file from an empty directory.
+#
+# Remark: Symbolic links are not counted in 'files'. 
+#
+# In case of failure, return None
+#
+def query_path_properties(nas,path):
     
-
-class QueryAction(Action):
+        r, ans = nas.request_json( 'POST',
+                                    "/portal/apis/fileExplorer/fileExplorer.cgi",
+                                    params = {
+                                        'act': 'get_properties',
+                                        'total': 1,
+                                        'file_path': path
+                                    }
+                                  )
+        # Wait for the task completion.
+        # That may take a while if path is a directory because of the recursive 
+        # count of inner files and directories
+        pid=ans['pid']
+        while True :
+            r, ans = nas.request_json( 'POST',
+                                       "/portal/apis/fileExplorer/fileExplorer.cgi",
+                                       params = {
+                                           'act': 'get_properties_progress',
+                                           'pid': pid,
+                                       }
+                                      )
+            status = ans['status'] 
+            assert status in ( 'done' , 'continue' )
+            if status=='done':
+                if ans['total'] == 0:
+                    return None
+                elif ans['total'] == 1:
+                    return ans['files'][0] 
+                else:
+                    # That must be possible? How?
+                    # Could that be when the filename encoding is ambiguous
+                    # such as UTF-8 allowing multiple representation of the same character?
+                    err_print('Hoops! Multiple matches in query_path_properties()')
+                    sys.exit(1)
+            time.sleep(0.1) 
+            
+        
+class DeleteAction(Action):
     def __init__(self, name, subparser):
         super().__init__( name,
                           subparser,
-                          help='Perform a custom cgi query',
-                          description='Perform a custom cgi query',
+                          help='Delete or move to the RecycleBin',
+                          description='Delete or move to the RecycleBin',
                           epilog=\
                           "\n"\
-                          "Each spec should be of one of the following forms:\n"\
-                          "   name=value to pass a argument in the URL (i.e. GET)\n"\
-                          "   name:=value to pass a argument in the body (i.e. POST)\n"\
-                          "   name@=filename to attach a file to the request\n"\
-                          "\n"\
-                          "The 'sid' argument is implictly passed and should not be specified here\n"\
-                          ,
+                          "\n",
                           formatter_class=argparse.RawTextHelpFormatter
                          )
-        self.parser.add_argument('-i', '--ignore-response', action='store_true',
-                                help='Do not attempt to interpret response (silent)')
-        self.parser.add_argument('-H', '--show-headers', action='store_true',
-                                help='Print the response headers ')
-        self.parser.add_argument('-r', '--raw', action='store_true',
-                                 help="Print the raw response content")
-        self.parser.add_argument('-o', '--output', type=str, metavar='FILE',required=False, default=None, 
-                                 help="Save the response content to file")
-        self.parser.add_argument('-s', '--save-headers', type=str, metavar='FILE',required=False, default=None, 
-                                 help="Save the response headers to file")
-        self.parser.add_argument('-c', '--content-type', type=str, metavar='STR',required=False, default=None, 
-                                 help="Set the content type for all file specifications")
-        self.parser.add_argument('cgi',
-                                 help="path to the cgi file")
-        self.parser.add_argument('spec', nargs='*',
-                                 help="parameter specification of the form name=value or name:=value")
-       
+        self.parser.add_argument('--recursive', dest='recursive', action='store_true',
+                                 help='Allow deletion of non-empty directories')
+        self.parser.add_argument('--no-wait', dest='wait', action='store_false', 
+                                 help='Do not wait for the task completion.')
+        self.parser.add_argument('path',  default=None, 
+                                 help="The file or directory to remove")
+
     def run(self, nas, args):
 
-        cgi = args.cgi
-        if not ( cgi.startswith('/portal/apis/') and cgi.endswith('.cgi') ) :
-            err_print("cgi should be of the form '/portal/apis/.../FILE.cgi'")
-            sys.exit(2)
+        
+        if not args.recursive:
+            prop = query_path_properties(nas,args.path)
 
-        # Transform each param_spec into an entry in params, data or files
-        params={}
-        data={}
-        files={}
-        re_spec=re.compile("^([a-zA-Z_][a-zA-Z_0-9]*)(=|:=|@=)(.*)$")
-        for spec in args.spec:
-            m = re_spec.match(spec)
-            if not m:
-                err_print(f"unexpected argument {spec}. Expect name=value or name:=value")
+            if prop is None:
+                err_print("File or directory not found")
                 sys.exit(1)
-            name=m.group(1)
-            sep=m.group(2)
-            value=m.group(3)
-            if name == 'sid':
-                err_print(f"Warning: Ignoring sid parameter")
-                continue
-            if sep == '=' :
-                params[m.group(1)] = m.group(3) 
-            elif sep == ':=' :
-                data[m.group(1)] = m.group(3) 
-            elif sep == '@=' :
-                filename=m.group(3)
-                if args.content_type:
-                    content_type=args.content_type
-                else:
-                    content_type=guess_content_type(filename)
-                    # err_print(f"Warning: No content type specified. Guessing {content_type}")
-                    
-                with open(filename,"rb") as f:
-                    files[m.group(1)] = ( Path(filename).name , f.read(), content_type )
+
+            if prop['files']!=0 or prop['folder']!=0 :
+                err_print('Abort! Directory is not empty')
+                sys.exit(0)
+
+        # QUESTION: Is there a secret argument to force physical removal instead of moving to the RecycleBin?
+        
+        r, ans = nas.request_json( 'POST',
+                                    "/portal/apis/fileExplorer/fileExplorer.cgi",
+                                    params = {
+                                        'act': 'delete',
+                                        'total': 1,
+                                        'file': args.path
+                                    }
+                                  )
+        print(ans)
+        # Remark: Always do at least one 'delete_progress' query to
+        #         catch immediate errors such as 'No such file or directory'
+        #         or 'Operation not permitted'
+        if args.wait:
+            print("Delete task started. Please wait.")
+        pid = ans['pid']
+        progress=0
+        delay=0.0
+        start=time.time()
+        while progress < 1 :
+            time.sleep(delay)                
+            r2, ans2 = nas.request_json( 'POST',
+                                         "/portal/apis/fileExplorer/fileExplorer.cgi",
+                                         json_raise_on_error=[5011],
+                                         params = {
+                                             'act': 'delete_progress',
+                                             'pid': pid,
+                                         }
+                                    )
+            delay=0.25
+            if ans2['success'] == False and ans2['error_code'] == 5011 :                    
+                print("Warning: Some files or directories were not deleted.")
+                break
             else:
-                assert False
-
-        r = nas.request('POST',
-                        cgi,
-                        params = params,
-                        data   = data,
-                        files  = files
-                        )
-
-        if args.output:
-            with open(args.output, "wb") as out:
-                out.write(r.content)
-        
-        if args.show_headers:
-            for key in sorted(r.headers.keys()):
-                print(f"{key}: {r.headers[key]}")
-            print("")        
+                progress = ans2['progress']
+            if not args.wait:
+                break
+        elapsed=time.time()-start
+        if args.wait:
+            print("Delete task completed in %.2f seconds." % elapsed)
             
-        if args.save_headers:
-            with open(args.save_headers, "w") as out:
-                for key in sorted(r.headers.keys()):
-                    print(f"{key}: {r.headers[key]}",file=out)
-            
-        if args.ignore_response:
-            return 0        
-        
-        if args.raw:        
-            sys.stdout.buffer.write(r.content)
-            return 0
-        
-        print(f"Response contains {len(r.content)} bytes")
-        
-        content_disposition = r.headers.get('Content-Disposition','')
-        if content_disposition.startswith('attachment;'):
-            print(f"Attachement detected: {content_disposition}. ")                
-            return 0
-        else:
-            print(f"Interpreting response as JSON")                
-            j = nas.response_as_json( r, False )
-            pprint.pprint(j)
-        return 0
-        
-
+        return 0                
 
 class LoginInfoAction(Action):
     
@@ -611,43 +961,46 @@ class NopAction(Action):
     def run(self, nas, args):
         print('ok')
         return 0
-        
+
 class ListDirectoryAction(Action):
     
     def __init__(self, name, subparser, default_mode):
         self.name = name
 
         epilog=\
+            "slkjfsdjf sdlfj sdj flksjd flkj sdlkfj lklld lj s  fl fj l jsl  flfljl  jlj fljljs ffldl js flkf\n"\
+            "sdfjlsdf jkls dfklj sdklfj kldsj lkkj skffjlsjs  sk jl lfk slflks fjslkfj lsd jsdljsfjljfk d jf d \n"\
             "\n"\
-            "Parameter specifications of the form name=value are sent in the query string \n"\
-            "while those of the form name:=value are sent in the body. \n"\
-            "\n"\
-            "The 'sid' argument is implictly passed and should not be specified here\n"
+            "  - aaa\n"\
+            "  - bbb\n"\
+            "  - ccc\n"\
+            "  - ddd\n"\
             
         super().__init__( name,
                           subparser, 
                           help="List directory",
                           description='List directory',
                           epilog=epilog,
-                          formatter_class=argparse.RawTextHelpFormatter
+                          #formatter_class=argparse.RawTextHelpFormatter
+                          formatter_class=argparse.RawDescriptionHelpFormatter
                          )
         self.parser.add_argument('-e', '--escape', action='store_true',
                                  help='escape special characters in filenames')
         self.parser.add_argument('-f', '--filter', type=str, metavar='TEXT',required=False, default=None,
                                  help='show only the filenames containing TEXT')
-        self.parser.add_argument('-0', '--null', action='store_true',
-                                 help='use null character as separator instead of newline (short mode only)')
         
         # Those options control the output mode
         mode_group = self.parser.add_mutually_exclusive_group()
-        mode_group.add_argument('-s', '--short', action='store_const', dest='mode', const='short', default=default_mode,
-                                help='display the filenames only')
+        mode_group.add_argument('-p', '--print', action='store_const', dest='mode', const='print', default=default_mode,
+                                help='display the filenames separated by a newline')
+        mode_group.add_argument('-0', '--print0', action='store_const', dest='mode', const='print0', default=default_mode,
+                                help='display the filenames separated by a null \'\\0\' character')
         mode_group.add_argument('-l', '--long', action='store_const', dest='mode', const='long',
                                 help='display using a long listing format')
         mode_group.add_argument('-a', '--all', action='store_const', dest='mode', const='full',
-                                help='display the full response')
+                                help='display the full response in python syntax')
         mode_group.add_argument('-r', '--raw', action='store_const', dest='mode', const='raw',
-                                help='display the raw json response ')
+                                help='display the raw response (usually json)')
         
         self.parser.add_argument('location', nargs='?', default='share', 
                             help="The location to list (default is '%(default)s'}")
@@ -714,24 +1067,20 @@ class ListDirectoryAction(Action):
 
                 print('{:10} {:10} {:10} {:12} {:16} {}'.format(mode, owner, group, file_size, modify_time, filename) )
 
-        elif args.mode == 'short' :
-            sep=''
+        elif args.mode == 'print' or  args.mode == 'print0' :
+            end="\0" if args.mode == 'print0' else "\n"
             for entry in ans['data'] :
-                filename    = entry['filename']
+                filename = entry['filename']
                 if args.escape :
                     filename = filename.replace("\n",r'\n').replace("\t",r'\t').replace("\\",r'\\')
-                print(sep,end="")
-                print(filename,end="")
-                if args.null:
-                    sep="\0"
-                else:
-                    sep="\n"
+                print(filename,end=end)
+                
         elif args.mode == 'full' :
             pprint.pprint(ans)
         elif args.mode == 'raw' :
             sys.stdout.buffer.write(r.content)
         else:
-            raise "Unhandled mode"
+            raise Exception(f"Unhandled mode '{args.mode}'")
 
 # Custom argparse action to load a credential file.
 # The file shall contains 3 lines for the account, password and url.
@@ -763,10 +1112,8 @@ def main():
 
     try:
         parser = argparse.ArgumentParser(description='Execute actions using the ADM Portal Web interface',
-                                         usage='nas-cmd.py [OPTION...] ACTION ...',
                                          epilog=
-                                         "Use ACTION -h for a detailed description of the arguments\n" \
-                                         "supported by each action.",
+                                         "Each action provides its own documentation with -h, --help",
                                          formatter_class=argparse.RawTextHelpFormatter
                                          )
         # Note: Use 'main_' prefix for all attributes to avoid conflicts with action arguments.     
@@ -789,7 +1136,7 @@ def main():
                             dest='main_logging_debug',
                             help='Enable debug in logging')
         
-        subparsers = parser.add_subparsers(title='Possible ACTIONs are',
+        subparsers = parser.add_subparsers(title='with',
                                            dest='main_action',
                                            required=True,
                                            metavar='ACTION',
@@ -799,13 +1146,222 @@ def main():
 
         # Instanciate all known actions and their sub-argument parser
         CatAction('cat',subparsers) 
+        DeleteAction('delete',subparsers) 
         DownloadAction('download',subparsers) 
         LoginInfoAction('login_info',subparsers)
-        ListDirectoryAction('ls',subparsers,'short') 
+        ListDirectoryAction('ls',subparsers,'print') 
         ListDirectoryAction('ll',subparsers,'long') 
         NopAction('nop',subparsers) 
         QueryAction('query',subparsers) 
         UploadAction('upload',subparsers) 
+
+        #
+        # Below are the simple queries with constant arguments.
+        #
+        
+        BasicAction('activity-list',
+                    subparsers,
+                    cgi='/portal/apis/activityMonitor/act.cgi',
+                    params={ 'act': 'list' },
+                    help='TO BE DOCUMENTED',
+                    #description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+
+        BasicAction('sysinfo-wan',
+                    subparsers,
+                    cgi='/portal/apis/information/sysinfo.cgi',
+                    params={ 'act': 'wan' },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        BasicAction('sysinfo-sys',
+                    subparsers,
+                    cgi='/portal/apis/information/sysinfo.cgi',
+                    params={ 'act': 'sys' },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        BasicAction('sysinfo-net',
+                    subparsers,
+                    cgi='/portal/apis/information/sysinfo.cgi',
+                    params={ 'act': 'net' },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+        
+        BasicAction('service-terminal-get',
+                    subparsers,
+                    cgi='/portal/apis/services/terminal.cgi',
+                    params={ 'act': 'get' },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        
+        BasicAction('service-smb-get',
+                    subparsers,
+                    cgi='/portal/apis/services/windows.cgi',
+                    params={
+                        'act': 'get',
+                        'tab': 'cifs'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        BasicAction('service-afp-get',
+                    subparsers,
+                    cgi='/portal/apis/services/mac.cgi',
+                    params={
+                        'act': 'get'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        BasicAction('service-nfs-get',
+                    subparsers,
+                    cgi='/portal/apis/services/nfs.cgi',
+                    params={
+                        'act': 'get',
+                        'tab': 'Nfs_Get_Enable'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        BasicAction('service-ftp-general-get',
+                    subparsers,
+                    cgi='/portal/apis/services/ftp.cgi',
+                    params={
+                        'act': 'get',
+                        'tab': 'general' 
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        BasicAction('service-ftp-advanced-get',
+                    subparsers,
+                    cgi='/portal/apis/services/ftp.cgi',
+                    params={
+                        'act': 'get',
+                        'tab': 'advanced'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    ) 
+
+        BasicAction('service-http-webdav-get',
+                    subparsers,
+                    cgi='/portal/apis/services/http.cgi',
+                    params={
+                        'act': 'get',
+                        'tab': 'webdav'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+        
+        BasicAction('service-rsync-get-modules',
+                    subparsers,
+                    cgi='/portal/apis/services/rsync.cgi',
+                    params={
+                        'act': 'get_module_list',
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+        
+        BasicAction('service-rsync-get',
+                    subparsers,
+                    cgi='/portal/apis/services/rsync.cgi',
+                    params={
+                        'act': 'get_sets',
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+
+        BasicAction('service-tftp-get',
+                    subparsers,
+                    cgi='/portal/apis/services/tftp_server.cgi',
+                    params={
+                        'act': 'get',
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+        
+        BasicAction('service-snmp-get',
+                    subparsers,
+                    cgi='/portal/apis/services/tftp_server.cgi',
+                    params={
+                        'act': 'get',
+                        'tab': 'Get'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+        
+        BasicAction('service-sftp-get',
+                    subparsers,
+                    cgi='/portal/apis/services/sftp.cgi',
+                    params={
+                        'act': 'get'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+        
+        BasicAction('service-proxy-get-blocks',
+                    subparsers,
+                    cgi='/portal/apis/services/proxy.cgi',
+                    params={
+                        'act': 'get_server_blocks'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+
+        BasicAction('service-proxy-get-default',
+                    subparsers,
+                    cgi='/portal/apis/services/proxy.cgi',
+                    params={
+                        'act': 'get_default_proxy_info'
+                    },
+                    help='TO BE DOCUMENTED',
+                    description='TO BE DOCUMENTED',
+                    epilog='TO BE DOCUMENTED'
+                    )
+        
+        BasicAction('basic',
+                    subparsers,
+                    '/portal/apis/services/proxy.cgi',
+                    params= {
+                        'act': 'get_default_proxy_info'
+                    },
+                    help='TO BE DOCUMENTED',                    
+                    )
         
         a = parser.parse_args() 
 
@@ -832,29 +1388,30 @@ def main():
             
         err=0
             
-        nas = NasPortal()
+        nas = NasSession()
 
         nas.login(URL, ACCOUNT, PASSWORD)
         action = Action.find(a.main_action)
-        err = action.run(nas,a)
-        nas.logout
+        ok = action.run(nas,a)
+        assert type(ok)==bool
+        nas.logout()
  
-        sys.exit(err)
-
+        sys.exit(int(!ok))  # So 0 in case of success otherwise 1
+  
     except FileNotFoundError as e:
         err_print(e) 
-        sys.exit(2)
+        sys.exit(1)
         
     except PermissionError as e:
         err_print(e) 
-        sys.exit(2)
+        sys.exit(1)
         
     except requests.exceptions.RequestException as e:
         ename = full_class_name(e)
         err_print(f"{ename}: {e}")
         sys.exit(2)
 
-    except NasPortalResponseError as e:
+    except NasSessionResponseError as e:
         # Most error responses from ADM Portal contain only 3 fields:
         #   success=false, error_code and error_msg.
         # but a few may contain more that may need to be handled separately.
@@ -864,15 +1421,19 @@ def main():
         if error_code:
            msg += f" #{error_code}"
         if error_msg:
-           msg += f" '{error_msg}'"        
+           msg += f" '{error_msg}'"
         err_print(msg)
         # Warn about additional fields in error response
         more_keys=set(e.json.keys())
         more_keys.discard('success')
         more_keys.discard('error_msg')
-        more_keys.discard('error_code')        
+        more_keys.discard('error_code')
+        # lacked_acl is usually with 'Operation not permitted'.
+        # This is a number describing the missing permissions 
+        more_keys.discard('lacked_acl')  
         if more_keys: 
             err_print("Warning: Unhandled data in error response: {0}".format(", ".join(more_keys)))
+        
         sys.exit(2)
 
     # Other exceptions are likely programming errors 
